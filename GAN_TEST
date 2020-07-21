@@ -1,0 +1,398 @@
+#coding:utf-8
+import cv2  
+from PIL import Image
+import matplotlib.pyplot as plt
+import scipy.misc as scm
+#常用图像处理库
+import tensorflow as tf
+#tensorflow框架
+from keras.layers import Convolution1D, Dense
+from keras.layers import Conv1D, SpatialDropout1D
+from keras.layers import Activation, Lambda
+import keras.backend as K
+import keras.layers
+from keras.models import Input,Model
+from keras import optimizers
+#keras框架相关
+from sklearn.model_selection import train_test_split
+#常用机器学习库
+import cPickle as pickle
+import sys
+import os
+import time
+import numpy as np
+#python常用库
+
+from vlib.layers import *
+from vlib.get_inputs import get_inputs
+import vlib.plot as plot
+#自定义库
+
+X_train, X_test, Y_train, Y_test = get_inputs() #得到训练数据和测试数据
+resize = 16 #input shape
+n_components = 1 #input channel
+
+
+class Train(object):
+    #初始化函数，自动调用
+    def __init__(self, sess):
+        #sess=tf.Session()
+        self.labeled_number = 16 #标记样本所占比例
+        self.sess = sess
+        self.img_size = resize   # the size of image
+        self.trainable = True
+        self.batch_size = 200  # must be even number
+        self.lr = 0.0002
+        self.mm = 0.4      # momentum term for adam
+        self.z_dim =  64 # the dimension of noise z
+        self.EPOCH = 300    # the number of max epoch
+        self.LAMBDA = 0.1  # parameter of WGAN-GP
+        self.model = 'WGAN_GP'
+        self.dim = n_components      #输入通道数
+        self.num_class = 12          #类数
+        self.load_model = False   #是否需要加载模型
+        #self.load_model =.load_model
+        self.build_model()  # initializer
+
+    #模型建立函数
+    def build_model(self):
+        #建立placeholder
+        self.x=tf.placeholder(tf.float32,shape=[self.batch_size,self.img_size*self.img_size*self.dim],name='real_img') #输入的图片
+        self.z = tf.placeholder(tf.float32, shape=[self.batch_size, self.z_dim], name='noise') #输入的噪音
+        self.label = tf.placeholder(tf.float32, shape=[self.batch_size, self.num_class - 1], name='label') #输入的标签
+        self.flag = tf.placeholder(tf.float32, shape=[], name='flag') #标记样本无标记样本切换flag
+        self.flag2 = tf.placeholder(tf.float32, shape=[], name='flag2') #常值，为true
+
+        #定义网络输出
+        self.G_img = self.generator('gen', self.z, reuse=False) #G网络的输出
+        d_logits_r, layer_out_r = self.discriminator('dis', self.x, reuse=False) #D网络的输出1
+        d_logits_f, layer_out_f = self.discriminator('dis', self.G_img, reuse=True) #D网络的输出2
+
+        d_regular = tf.add_n(tf.get_collection('regularizer', 'dis'), 'loss')  #损失正则化项
+        #无监督损失
+        un_label_r = tf.concat([tf.ones_like(self.label), tf.zeros(shape=(self.batch_size, 1))], axis=1) #真是样本标签
+        un_label_f = tf.concat([tf.zeros_like(self.label), tf.ones(shape=(self.batch_size, 1))], axis=1) #伪样本标签
+        logits_r, logits_f = tf.nn.softmax(d_logits_r), tf.nn.softmax(d_logits_f) #两个D的softmax判定结果
+        d_loss_r = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=un_label_r*0.9, logits=d_logits_r))#无监督损失1
+        d_loss_f = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=un_label_f*0.9, logits=d_logits_f))#无监督损失2
+        # feature match
+        f_match = tf.constant(0., dtype=tf.float32) #feature match， 帮助网络训练的trick
+        for i in range(4):
+            f_match += tf.reduce_mean(tf.multiply(layer_out_f[i]-layer_out_r[i], layer_out_f[i]-layer_out_r[i]))
+
+        #有监督损失
+        s_label = tf.concat([self.label, tf.zeros(shape=(self.batch_size,1))], axis=1)
+        s_l_r = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=s_label*0.9, logits=d_logits_r)) #有监督损失
+        s_l_f = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=un_label_f*0.9, logits=d_logits_f))  # same as d_loss_f
+        self.d_l_1, self.d_l_2 = d_loss_r - d_loss_f, s_l_r #测试用损失，不参与优化
+       
+        #整体损失
+        self.d_loss = -d_loss_r + d_loss_f + s_l_r*self.flag*10 + d_regular #有监督时flag为1,无监督flag为0
+        self.g_loss = d_loss_f + 0.01*f_match
+
+        all_vars = tf.global_variables()
+        g_vars = [v for v in all_vars if 'gen' in v.name]
+        d_vars = [v for v in all_vars if 'dis' in v.name]
+       #模型优化选择，默认就是WGAN-GP
+        if self.model == 'DCGAN':
+            self.opt_d = tf.train.AdamOptimizer(self.lr, beta1=self.mm).minimize(self.d_loss, var_list=d_vars)
+            self.opt_g = tf.train.AdamOptimizer(self.lr, beta1=self.mm).minimize(self.g_loss, var_list=g_vars)
+        elif self.model == 'WGAN_GP':
+            self.opt_d = tf.train.AdamOptimizer(1e-5, beta1=0.5, beta2=0.9).minimize(self.d_loss, var_list=d_vars)
+            self.opt_g = tf.train.AdamOptimizer(1e-5, beta1=0.5, beta2=0.9).minimize(self.g_loss, var_list=g_vars)
+        else:
+            print ('model can only be "DCGAN","WGAN_GP" !')
+            return
+        
+        test_logits, _ = self.discriminator('dis', self.x, reuse=True)#测试用参数，不参与训练
+        test_logits = tf.nn.softmax(test_logits)
+        temp = tf.reshape(test_logits[:, -1],shape=[self.batch_size, 1])
+        for i in range(self.num_class-1):
+            temp = tf.concat([temp, tf.reshape(test_logits[:, -1],shape=[self.batch_size, 1])], axis=1)
+        test_logits -= temp
+        self.my_check = test_logits #测试用参数，不参与训练
+        self.prediction = tf.nn.in_top_k(test_logits, tf.argmax(s_label, axis=1), 1)  #模型预测
+
+        self.saver = tf.train.Saver() #模型保存器
+
+        if not self.load_model: #是否加载模型
+            init = tf.global_variables_initializer()
+            self.sess.run(init)
+        elif self.load_model:
+            self.saver.restore(self.sess, os.getcwd()+'/model_saved/model.ckpt')
+            print 'model load done'
+        self.sess.graph.finalize() #初始化tensorflow 图
+    #训练主函数
+    def train(self):
+	#是否加载模型
+        if not os.path.exists('model_saved'):
+            os.mkdir('model_saved')
+        if not os.path.exists('gen_picture'):
+            os.mkdir('gen_picture')
+	#初始化噪声
+        noise = np.random.normal(-1, 1, [self.batch_size, self.z_dim])
+        temp = 0.90 #设定开始保存模型的准确率阈值
+        print 'training'
+	#训练迭代开始
+        for epoch in range(self.EPOCH):
+            noise = np.random.normal(-1, 1, [self.batch_size, self.z_dim])
+            # iters = int(156191//self.batch_size)
+            iters = len(X_train)//self.batch_size #打印每一epoch的batch数量，从而设定labeled_number参数，改变又标签和无标签比例
+            print iters
+            flag2 = 1  # if epoch>10 else 0 
+            for idx in range(iters): #每一个epoch都对所有batch训练
+                start_t = time.time() #可以记录训练时间，不过没用开启
+                flag = 1 if idx < self.labeled_number else 0 # set we use 2*batch_size=200 train data labeled. 
+                batchx = X_train[idx*self.batch_size:(idx+1)*self.batch_size] #数据
+                batchl = Y_train[idx*self.batch_size:(idx+1)*self.batch_size] #标签
+                #batchx, batchl = mnist.train.next_batch(self.batch_size)
+                # batchx, batchl = self.sess.run([batchx, batchl])
+                g_opt = [self.opt_g, self.g_loss] 
+                d_opt = [self.opt_d, self.d_loss, self.d_l_1, self.d_l_2]
+                feed = {self.x:batchx, self.z:noise, self.label:batchl, self.flag:flag, self.flag2:flag2} #tensorflow模型图的feed
+                # update the Discrimater k times
+                _, loss_d, d1,d2 = self.sess.run(d_opt, feed_dict=feed) #运行tensorflow的图，得到D的loss
+                # update the Generator one time
+                _, loss_g = self.sess.run(g_opt, feed_dict=feed) #运行tensorflow的图，得到G的loss
+                
+                
+               
+                print ("[%3f][epoch:%2d/%2d][iter:%4d/%4d],loss_d:%5f,loss_g:%4f, d1:%4f, d2:%4f"%
+                       (time.time()-start_t, epoch, self.EPOCH,idx,iters, loss_d, loss_g,d1,d2)), 'flag:',flag #打印训练过程中的损失
+                plot.plot('d_loss', loss_d) #画出D的loss图
+                plot.plot('g_loss', loss_g) #画出G的loss图
+             
+                if ((idx+1) % 100) == 0:  # 每隔一段时间保存一下两种loss图
+                    plot.flush()
+                plot.tick()
+ 
+
+
+            #img = self.sess.run(self.G_img, feed_dict={self.z:noise})
+            #img = img*2-1
+            #fig = plt.figure()
+            #plt.imshow(img[0])
+            #plt.savefig('generate_piic')
+            
+                    #print 'images save done'
+
+            
+            test_acc = self.test() #每个epoch后都调用测试函数，通过观察测试曲线，确保模型没有过拟合
+            print test_acc #打印每个epoch后的准确率
+            plot.plot('test acc', test_acc)
+            plot.flush()
+            plot.tick()
+          
+            print 'test acc:{}'.format(test_acc), 'temp:%3f'%(temp)
+          
+            if test_acc > temp: #如果测试准确率大于设定的最低阈值，保存模型
+                print ('model saving..............')
+                path = os.getcwd() + '/model_saved'
+                save_path = os.path.join(path, "model.ckpt")
+                self.saver.save(self.sess, save_path=save_path)
+                print ('model saved...............')
+                temp = test_acc
+        print 'best_acc ', temp            
+
+    # output = conv2d('Z_cona{}'.format(i), output, 3, 64, stride=1, padding='SAME')
+    #构建生成器网络
+    def generator(self,name, noise, reuse):
+        with tf.variable_scope(name,reuse=reuse): #设定命名阈，以便操作reuse
+            l = self.batch_size
+            output = fc('g_dc', noise, 2*2*64) #全链接fc
+            output = tf.reshape(output, [-1, 2, 2, 64]) #reshape，仅改变shape无参数
+            output = tf.nn.relu(self.bn('g_bn1',output)) #激活层和batch norm
+            output = deconv2d_none('g_dcon1',output,3,outshape=[l, 2, 2, 64*8]) #反卷积2d
+            output = tf.nn.relu(self.bn('g_bn2',output))
+
+            output = deconv2d('g_dcon2', output, 3, outshape=[l, 4, 4, 64 * 4])
+            output = tf.nn.relu(self.bn('g_bn3', output))
+
+            output = deconv2d_none('g_dcon3', output, 3, outshape=[l, 4, 4 ,64 * 2])
+            output = tf.nn.relu(self.bn('g_bn4', output))
+
+            output = deconv2d('g_dcon4', output, 3, outshape=[l, 8, 8, 64*2])
+            output = tf.nn.relu(self.bn('g_bn5', output))
+
+            output = deconv2d_none('g_dcon5', output, 3, outshape=[l, 8, 8, 64*1])
+            output = tf.nn.relu(self.bn('g_bn6', output))
+            
+            output = deconv2d('g_dcon6', output, 3, outshape=[l, 16, 16, self.dim])
+            
+            #output = tf.image.resize_images(output, (resize, resize))
+            #output = tf.nn.relu(self.bn('g_bn4', output))
+            return tf.nn.tanh(output)
+    #尝试构建了一个一维卷积的判别器，不过因为效果不好没用使用，实际采用的是后面的二维卷积判别器
+    def discriminator_1d(self, name, inputs, reuse):
+    
+        dropout_rate = 0.05
+        
+        l = tf.shape(inputs)[0]
+        inputs = tf.reshape(inputs, (l,self.img_size*self.img_size,self.dim))
+        print inputs.shape
+        filter_number = 16
+        with tf.variable_scope(name,reuse=reuse):
+            conv = Convolution1D(filter_number, 3, strides = 1, padding = 'SAME', name = 'd_con1')(inputs)#128
+            x = Activation('relu')(conv)
+            x = Lambda(self.channel_normalization)(x)
+            x = SpatialDropout1D(dropout_rate, name = 'Dropout1')(x)
+
+            x = Convolution1D(filter_number, 3, strides = 1,padding = 'SAME', name = 'd_con2')(x)#64
+            x = Activation('relu')(x)
+            x = Lambda(self.channel_normalization)(x)
+            x = SpatialDropout1D(dropout_rate, name = 'Dropout2')(x)
+
+            x = Convolution1D(filter_number, 3, strides = 1, padding = 'SAME', name = 'd_con3')(x)#32
+            x = Activation('relu')(x)
+            x = Lambda(self.channel_normalization)(x)
+            x = SpatialDropout1D(dropout_rate, name = 'Dropout3')(x)
+
+            x = Convolution1D(filter_number, 3, strides = 1, padding = 'SAME', name = 'd_con4')(x)#16
+            x = tf.reshape(x,[l, filter_number*256])
+            x = fc('d_fc', x, self.num_class)
+            return x, conv
+
+    #实际使用的二维卷积判别器
+    def discriminator(self, name, inputs, reuse):
+        l = tf.shape(inputs)[0]
+        inputs = tf.reshape(inputs, (l,self.img_size,self.img_size,self.dim))
+        with tf.variable_scope(name,reuse=reuse):
+            out = []
+            output = conv2d('d_con1',inputs,3, 64, stride=2, padding='SAME') #输出的feature map shape为8
+            output1 = lrelu(self.bn('d_bn1',output))
+            out.append(output1)
+            # output1 = tf.contrib.keras.layers.GaussianNoise
+            output = conv2d('d_con2', output1, 3, 64*2, stride=2, padding= 'SAME')#输出的feature map shape为4
+            output2 = lrelu(self.bn('d_bn2', output))
+            out.append(output2)
+            output = conv2d('d_con3', output2, 3, 64*2, stride=1, padding='SAME')#输出的feature map shape为4(stride = 1)
+            output3 = lrelu(self.bn('d_bn3', output))
+            out.append(output3)
+            output = conv2d('d_con4', output3, 3, 64*4, stride=2, padding='SAME')#输出的feature map shape为2
+            output4 = lrelu(self.bn('d_bn4', output))
+            out.append(output4)
+            output = conv2d('d_con5', output4, 3, 64*4, stride=1, padding='SAME')#输出的feature map shape为2(stride = 1)
+            output5 = lrelu(self.bn('d_bn5', output))
+            out.append(output5)
+            output = tf.reshape(output5, [l, 2*2*64*4])#将feature map 一维化 2*2*64*4
+            output = fc('d_fc', output, self.num_class) #全链接成类数
+            # output = tf.nn.softmax(output)
+            return output, out
+
+    def bn(self, name, input): #实现batch norm函数
+        val = tf.contrib.layers.batch_norm(input, decay=0.9,
+                                           updates_collections=None,
+                                           epsilon=1e-5,
+                                           scale=True,
+                                           is_training=True,
+                                           scope=name)
+        return val
+    
+    def test(self): #模型测试函数
+        count1 = 0.
+        count2 = 0.
+        count = 0.
+        print 'testing................'
+        
+        X_ = X_test
+        Y_ = Y_test
+	#对训练数据和测试数据分别测试
+        for i in range(len(X_)//self.batch_size):
+            testx = X_[i*self.batch_size:(i+1)*self.batch_size] #测试数据
+            testl = Y_[i*self.batch_size:(i+1)*self.batch_size] #测试标签       
+            #testx, textl = mnist.test.next_batch(self.batch_size)
+            prediction = self.sess.run(self.prediction, feed_dict={self.x:testx, self.label:testl}) #预测结果
+            count1 += np.sum(prediction) #统计测试数据中正确数量
+        #return count/len(X_test)
+        #++++++++++++++++++++++++++++++++
+        for i in range(len(X_train)//self.batch_size):
+            testx = X_train[i*self.batch_size:(i+1)*self.batch_size] #测试数据
+            testl = Y_train[i*self.batch_size:(i+1)*self.batch_size] #测试标签 
+            #print testl[0:10]
+            #testx, textl = mnist.test.next_batch(self.batch_size)
+            prediction = self.sess.run(self.prediction, feed_dict={self.x:testx, self.label:testl}) #预测结果
+            count2 += np.sum(prediction) #统计训练数据中正确数量
+        print 'acc1 ',count1/len(X_ ), 'acc2 ', count2/len(X_train)
+        print 'numbers ' ,count1,count2,len(X_ ),len(X_train),(count1+count2)/(len(X_ )+len(X_train))
+        return 'total_acc ', (count1+count2)/(len(X_ )+len(X_train)) #最终返回总的准确率
+
+    
+    def per_test(self): #早期编辑的预测试函数，实际训练没有调用
+        a= []
+        b= []
+        count = 0
+        print Y_test[0]
+        for i in range(len(X_test)):
+            if (Y_test[i] == Y_test[0]).all():
+                a.append(X_test[i])
+                b.append(Y_test[i])
+
+        for i_batch in range(len(a)//self.batch_size):
+            batch_testx = a[i_batch*self.batch_size:(i_batch+1)*self.batch_size]
+            batch_testl = b[i_batch*self.batch_size:(i_batch+1)*self.batch_size]
+            prediction = self.sess.run(self.prediction, feed_dict={self.x:batch_testx, self.label:batch_testl})
+            count += np.sum(prediction)
+        print count
+        print len(a)
+        
+        #print [l.tolist().index(max(l)) for l in prediction]
+        #print [np.argmax(l) for l in b]
+        
+        
+        for i in range(16):
+            count = 0.
+            this_cdata = cdata[cdata.keys()[i]]
+            this_ldata = ldata[ldata.keys()[i]]
+            this_cdata = np.array(this_cdata)
+            this_ldata = np.array(this_ldata)
+            #print this_ldata[0:10]
+            #temp = i*np.ones((len(this_data),1))
+            #testl = self.sess.run(tf.one_hot(temp,depth = 16))
+            #print len(this_cdata)//self.batch_size
+            for i_batch in range(len(this_cdata)//self.batch_size):
+                batch_testx = this_cdata[i_batch*self.batch_size:(i_batch+1)*self.batch_size]
+                batch_testl = this_ldata[i_batch*self.batch_size:(i_batch+1)*self.batch_size]            
+                prediction = self.sess.run(self.prediction, feed_dict={self.x:batch_testx, self.label:batch_testl})
+                count += np.sum(prediction)
+            print count,len(this_cdata)
+        
+            
+    # def get_loss(self, logits, layer_out):
+    '''
+    def test(self):
+        error = []
+        count = 0.
+        print 'testing................'
+        for i in range(len(X_test)//self.batch_size):
+            testx = X_test[i*self.batch_size:(i+1)*self.batch_size]
+            testl = Y_test[i*self.batch_size:(i+1)*self.batch_size]            
+            #testx, textl = mnist.test.next_batch(self.batch_size)
+            #prediction = self.sess.run(self.test_logits, feed_dict={self.x:testx, self.label:testl})
+            prediction = self.sess.run(self.prediction, feed_dict={self.x:testx, self.label:testl})
+            for j in range(len(prediction)):
+                if prediction[j]==False:
+                    error.append(testl[j])
+            count += np.sum(prediction)
+        err = [np.argmax(l) for l in error]
+        #print len(err)
+        #print count
+        #print len(X_test)
+        number = np.zeros((16,1))
+        for e in err:
+            number[e] +=1
+        #print number
+        return count/len(X_test)
+    '''    
+        #return prediction
+    
+  
+#gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.8) 
+#config = tf.ConfigProto(allow_soft_placement=True, gpu_options=gpu_options)
+#如果使用gpu则去掉上两行的注释
+sess = tf.Session() #建立一个tensorflow sess
+train_model =  Train(sess) #建立一个训练模型的类
+train_model.train() #启动训练函数
+
+
+
+
